@@ -366,11 +366,16 @@ function computeModel(p){
   const phoneCenter=crotch.clone().addScaledVector(dA,ph/2).addScaledVector(nA,pt/2);
   const lip=L2-b-T/2;
   const held=lip>=pt*0.7;
+  // backrest length above the crotch; phone pivots over A's top edge if its CoG lies behind that edge
+  const Lu=L1-a-T/2;
+  const LuNeed=ph/2-(pt/2)*s/c;
+  const phoneBal=Lu>LuNeed;
+  const flipEdge=crotch.clone().addScaledVector(dA,Lu);
   const mTot=mStand+p.pM;
   const cogAll=cogStand.clone().multiplyScalar(mStand).addScaledVector(phoneCenter,p.pM).divideScalar(mTot);
 
   const md={s,c,T,W,L1,L2,a,b,bIdeal,bOk,dA,nA,dB,uB,oA,oB,Pc,cA,cB,zb,zf,mA,mB,mStand,mTot,
-    cogStand,cogAll,iA,iB,ph,pw,pt,crotch,phoneCenter,lip,held,pM:p.pM};
+    cogStand,cogAll,iA,iB,ph,pw,pt,crotch,phoneCenter,lip,held,Lu,LuNeed,phoneBal,flipEdge,pM:p.pM};
 
   // wind exposure (cm², cm)
   const exposure=(withPhone)=>{
@@ -541,7 +546,7 @@ const windLines=new THREE.LineSegments(wGeo,new THREE.LineBasicMaterial({color:0
 scene.add(windLines);
 
 /* ---------------- state ---------------- */
-const S={phone:'off',anim:null,tip:null,acc:0,slide:new V3(),sliding:false,risk:0,riskDir:null,t:0,slipped:false,pb:null,impact:null,slow:false};
+const S={phone:'off',anim:null,tip:null,acc:0,slide:new V3(),sliding:false,risk:0,riskDir:null,t:0,slipped:false,pb:null,impact:null,slow:false,flip:null,phoneFall:null};
 
 function currentStab(){ return (S.phone==='on')?MD.withPhone:MD.alone; }
 
@@ -599,8 +604,8 @@ function resetDynamic(clearPhoneSlip=true){
   pivot.position.set(0,0,0); pivot.rotation.set(0,0,0); rig.position.set(0,0,0); world.position.set(0,0,0);
   if(phone.parent!==rig){ rig.add(phone); }
   if(clearPhoneSlip&&(S.phone==='slipped'||S.phone==='slipping')){S.phone='off'; phone.visible=false; S.anim=null;}
-  if(S.phone==='slipped'||S.phone==='slipping'){S.phone='off'; phone.visible=false; S.anim=null;}
-  S.slipped=false; S.pb=null; S.impact=null;
+  if(S.phone==='slipped'||S.phone==='slipping'||S.phone==='flipping'){S.phone='off'; phone.visible=false; S.anim=null;}
+  S.slipped=false; S.pb=null; S.impact=null; S.flip=null;
 }
 
 /* ---------- phone actions ---------- */
@@ -628,15 +633,43 @@ function removePhone(){
 function afterPlaced(){
   updateMarkers(); setPhoneBtn(); renderReport();
   if(!MD.held){ startSlip(); return; }
+  if(!MD.phoneBal){ startFlip(); return; }
   checkStatic();
 }
 function startSlip(){
-  S.phone='slipping';
+  S.phone='slipping'; S.phoneFall='lip';
   const g=phoneGroundPose();
   tween(0.9,phone.position.clone(),g.pos,phone.quaternion.clone(),g.q,()=>{
     S.phone='slipped'; world.attach(phone); updateMarkers(); setPhoneBtn(); updateStatusNow();
   },3);
   updateMarkers(); setPhoneBtn();
+}
+function startFlip(){
+  S.phone='flipping'; S.phoneFall='flip';
+  const r0=MD.phoneCenter.clone().sub(MD.flipEdge);
+  S.flip={ang:0,w:0.2,r0,q0:phone.quaternion.clone(),I:r0.lengthSq()+(MD.ph*MD.ph+MD.pt*MD.pt)/12};
+  updateMarkers(); setPhoneBtn(); updateStatusNow();
+}
+function stepFlip(dt){
+  const f=S.flip; if(!f) return;
+  const axis=new V3(-1,0,0), n=3, h=dt/n;
+  for(let i=0;i<n;i++){
+    const c=Math.cos(f.ang), s=Math.sin(f.ang);
+    const z=-f.r0.y*s+f.r0.z*c;                   // CoG z relative to A's top edge after rotating backward
+    f.w+=GCM*(-z)/f.I*h; f.ang+=f.w*h;
+  }
+  const R=new THREE.Quaternion().setFromAxisAngle(axis,f.ang);
+  const r=f.r0.clone().applyQuaternion(R);
+  phone.position.copy(MD.flipEdge).add(r);
+  phone.quaternion.copy(R).multiply(f.q0);
+  if(f.ang>0.6){                                  // phone has rolled over the top edge: let it fall freely
+    const wv=axis.clone().multiplyScalar(f.w);
+    const v=new V3().crossVectors(wv,r);
+    world.attach(phone);
+    S.pb={v,w:wv,hits:0,settling:false};
+    S.flip=null; S.phone='slipped';
+    updateMarkers(); setPhoneBtn(); updateStatusNow();
+  }
 }
 function checkStatic(){
   const st=currentStab();
@@ -771,7 +804,7 @@ function stepAnim(dt){
 function stepPhysics(dt){
   S.t+=dt;
   if(S.tip){advanceTip(dt); world.position.copy(S.slide); S.risk=1; return;}
-  if(S.phone==='placing'||S.phone==='removing'||S.phone==='slipping'){applyPivot(null,0); S.risk=0; return;}
+  if(S.phone==='placing'||S.phone==='removing'||S.phone==='slipping'||S.phone==='flipping'){applyPivot(null,0); S.risk=0; return;}
   const st=currentStab();
   const aPk=P.shake*SHAKE_PER_LEVEL, t=S.t;
   let az=0,ax=0;
@@ -828,7 +861,9 @@ function updateStatusNow(){
   let cls='', en='STATUS: STABLE', zh='穩定';
   if(S.tip){cls='bad'; en='STATUS: UNSTABLE (TIPPED)'; zh=`已${dirName[S.tip.dir]}傾倒`;
     if(S.impact!=null&&S.phone==='on'){const v=S.impact/100; zh+=`，手機落地速度 ${f1(v)} m/s（≈ 從 ${f1(S.impact*S.impact/(2*GCM))} cm 高跌下）`;}}
-  else if(S.phone==='slipping'||S.phone==='slipped'){cls='bad'; en='STATUS: UNSTABLE (PHONE SLIPPED)'; zh='托板唇口太短，手機滑落';}
+  else if(S.phone==='slipping'||S.phone==='slipped'||S.phone==='flipping'){cls='bad';
+    if(S.phoneFall==='flip'){en='STATUS: UNSTABLE (PHONE FELL OFF)'; zh='背板太矮，手機重心越過背板頂部，向後翻落';}
+    else {en='STATUS: UNSTABLE (PHONE SLIPPED)'; zh='托板唇口太短，手機滑落';}}
   else if(S.sliding){cls='warn'; en='STATUS: SLIDING'; zh='風力大於摩擦力，整體在桌面滑動';}
   else if(S.risk>0.75){cls='warn'; en='STATUS: NEAR LIMIT'; zh=`接近${dirName[S.riskDir]}傾覆臨界`;}
   else if(S.phone==='off'){zh='穩定（未放手機）';}
@@ -841,7 +876,7 @@ function updateStatusNow(){
 function loop(now){
   const dt=Math.min(0.05,(now-lastT)/1000); lastT=now;
   const sdt=S.slow?dt*0.25:dt;
-  stepAnim(sdt); stepPhysics(sdt); stepPhoneBody(sdt); stepWind(sdt);
+  stepAnim(sdt); stepFlip(sdt); stepPhysics(sdt); stepPhoneBody(sdt); stepWind(sdt);
   statusClock+=dt; if(statusClock>0.1){statusClock=0; updateStatusNow(); if(S.tip) updateMarkers();}
   orbit.update(); renderer.render(scene,camera);
   requestAnimationFrame(loop);
@@ -919,6 +954,7 @@ function renderReport(){
   const checks=[
     [MD.bOk,'兩板可同時觸地',MD.bOk?`底座槽口 b = ${f2(MD.b)} cm`:'把交叉位置 a 調小、或加長底座 L₂、或減少傾斜角'],
     [MD.held,'托板唇口托得住手機',`唇口 ${f1(MD.lip)} cm，需要 ≥ ${f1(MD.pt*0.7)} cm（手機厚度 × 0.7）`],
+    [MD.phoneBal,'背板夠高，手機不會向後翻落',`托板以上的背板長 ${f1(MD.Lu)} cm，最少需要 ${f1(Math.max(0,MD.LuNeed))} cm（約手機長度一半）`],
     [staticOk,'放上手機後重心在支撐範圍內',staticOk?`前方餘量 ${f1(w.df*100)} cm，後方餘量 ${f1(w.db*100)} cm`:'重心投影落在支撐範圍外，放上手機會翻倒'],
     [vmin>=5,'抗風 ≥ 5 m/s（風扇近距離吹）',`最弱方向臨界風速 ${f1(vmin)} m/s`],
     [aMin>=0.15,'抗震 ≥ 0.15 g（打字、輕碰桌面）',`臨界水平加速度 ${f2(aMin)} g ≈ 震動第 ${f1(aMin*G/SHAKE_PER_LEVEL)} 級`]
@@ -1096,7 +1132,7 @@ $('#btn-test').addEventListener('click',()=>{
 });
 $('#btn-bp').addEventListener('click',openBlueprint);
 $('#btn-push').addEventListener('click',()=>{
-  if(S.anim||S.tip||S.phone==='slipped') return;
+  if(S.anim||S.tip||S.phone==='slipped'||S.phone==='flipping') return;
   startTip({front:'B',back:'F',left:'R',right:'L'}[P.windDir]);
 });
 $('#t-slow').addEventListener('change',e=>{S.slow=e.target.checked;});
